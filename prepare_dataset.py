@@ -5,6 +5,7 @@ from PIL import Image, ImageDraw
 import json
 import cv2
 import re
+from pycocotools.coco import COCO
 
 
 class PrepareDataset:
@@ -13,7 +14,7 @@ class PrepareDataset:
         self.output_annotation_path = args.output_annotation
 
         self.annotations = []
-        self.coco_annotations = []
+        self.coco_annotations = {}
         self.llm_annotations = []
         self.images = []
         self.categories = {}
@@ -23,6 +24,7 @@ class PrepareDataset:
         self.image_id_map = {}
         self.image_id_counter = 1
         self.image_groups = {}
+        self.group_annotations = {}  # Хранение аннотаций для каждой группы
 
         self.init_dirs()
 
@@ -43,9 +45,6 @@ class PrepareDataset:
                 index = int(index)
                 img_extention = os.path.splitext(filename)[1]
                 
-                if base_name not in self.image_groups or index > self.image_groups[base_name]:
-                    self.image_groups[base_name] = index
-
                 bbox_file = os.path.join(self.bboxes_dir, filename.replace(img_extention, ".txt"))
                 class_file = os.path.join(self.classes_dir, filename.replace(img_extention, ".txt"))
                 
@@ -53,59 +52,88 @@ class PrepareDataset:
                     bbox = [float(f_bbox.readline().strip()) for _ in range(4)]
                     class_name = f_class.readline().strip()
                 
-                if base_name not in self.image_id_map or index > self.image_groups[base_name]:
-                    image_name = f"{base_name}"
-                    self.image_id_map[base_name] = self.image_id_counter
-                    self.images.append({
-                        "id": self.image_id_counter,
-                        "file_name": image_name,
-                        "width": image.width, 
-                        "height": image.height
-                    })
-                    self.image_id_counter += 1
+                self.images.append({
+                    "id": self.image_id_counter,
+                    "file_name": filename,
+                    "width": image.width, 
+                    "height": image.height
+                })
+                image_id = self.image_id_counter
+                self.image_id_counter += 1
                 
-                image_id = self.image_id_map[base_name]
-
                 if class_name not in self.categories:
                     self.categories[class_name] = self.category_id
                     self.category_id += 1
                 
-                self.annotations.append({
+                annotation = {
                     "id": self.annotation_id,
                     "image_id": image_id,
                     "category_id": self.categories[class_name],
                     "bbox": bbox,
-                    "area": (bbox[2]-bbox[0])*(bbox[3]-bbox[1]),
+                    "area": (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]),
                     "iscrowd": 0
-                })
+                }
+                self.annotations.append(annotation)
+                
+                if base_name not in self.group_annotations:
+                    self.group_annotations[base_name] = []
+                
+                # Добавляем все предыдущие аннотации этой группы
+                for ann in self.group_annotations[base_name]:
+                    self.annotation_id += 1
+                    ann2add = ann.copy()
+                    ann2add["id"] = self.annotation_id 
+                    ann2add["image_id"] = image_id
+                    self.annotations.append(ann2add)
+                    
+                self.group_annotations[base_name].append(annotation)
                 self.annotation_id += 1
 
         categories_list = [{"id": cid, "name": cname} for cname, cid in self.categories.items()]
-        self.images = [f"{img['file_name']}_{self.image_groups[img['file_name']]}{img_extention}" for img in self.images]
+        # self.images = [f"{img['file_name']}_{self.image_groups[img['file_name']]}{img_extention}" for img in self.images]
 
         self.coco_annotations["images"] = self.images
         self.coco_annotations["annotations"] = self.annotations
         self.coco_annotations["categories"] = categories_list
 
-    def count_objects(self):
-        for filename in images_paths:
-            # match = pattern.match(filename)
-            # if match:
-                # base_name, index = match.groups()   
+        with open(self.output_annotation_path, "w") as f:
+            json.dump(self.coco_annotations, f)
 
-            base_name = filename.split(".")[0]
-            img_extention = os.path.splitext(filename)[1]
+    def create_llm_dataset(self):
+        self.coco = COCO(self.output_annotation_path)
+        pattern = re.compile(r"(.+?_\d+_\d+)\..+")
+        for image in self.coco.dataset["images"]:
+            base_name = pattern.match(image["file_name"]).group(1)
+            filename = image["file_name"]
 
-            bbox_file = os.path.join(self.bboxes_dir, filename.replace(img_extention, ".txt"))
-            class_file = os.path.join(self.classes_dir, filename.replace(img_extention, ".txt"))
+            prompt = f"<image>\nCould you analyze this image and tell me the total number of"
+            answer = f"There"
+
+            anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=image["id"]))
+            classes = {}
+            for ann in anns:
+                class_name = self.coco.loadCats(ann["category_id"])[0]["name"]
+                if class_name not in classes:
+                    classes[class_name] = 1
+                else:
+                    classes[class_name] += 1
             
-            with open(bbox_file, "r") as f_bbox, open(class_file, "r") as f_class:
-                bbox = [float(f_bbox.readline().strip()) for _ in range(4)]
-                class_name = f_class.readline().strip()
+            if len(classes) == 1:
+                answer += " is"
+            elif len(classes) > 1:
+                answer += " are"
+            else:
+                continue
 
-            prompt = f"<image>\nсколько на картинке изображено {class_name}?"
-            answer = 1
+            for class_name, count in classes.items():
+                prompt += f" {class_name},"
+                if count > 1:
+                    class_name += "s"
+                answer += f" {count} {class_name},"
             
+            prompt = prompt[:-1]+ "?"
+            answer = answer[:-1] + "."
+
             self.llm_annotations.append({
                 "id": base_name,
                 "image": filename,
@@ -119,14 +147,14 @@ class PrepareDataset:
                     "value": answer
                 }]
             })
+
+        output_path = os.path.join(self.data_dir, "llm_annotations.json")
+        with open(output_path, "w") as f:
+            json.dump(self.llm_annotations, f)
     
     def prepare_dataset(self):
         self.parse_dataset()
-        
-
-        
-
-
+        self.create_llm_dataset()
 
 
 if __name__ == "__main__":
